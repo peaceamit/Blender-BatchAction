@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 5, 0),
+    "version": (0, 9, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -12,23 +12,39 @@ import bpy
 import importlib
 import sys
 import types
-from bpy.props import EnumProperty, StringProperty
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.props import CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 
 _uv_map_enum_items = []
 
 
-def get_selected_mesh_data(context):
-    selected_mesh_objects = [
-        obj for obj in context.selected_objects
+def get_target_objects(context):
+    settings = context.scene.batch_operation_settings
+
+    if settings.object_source == "DROP_LIST":
+        return [
+            item.object for item in settings.object_items
+            if item.object is not None
+        ]
+
+    return list(context.selected_objects)
+
+
+def get_target_mesh_objects(context):
+    return [
+        obj for obj in get_target_objects(context)
         if obj.type == "MESH"
     ]
+
+
+def get_target_mesh_data(context):
+    target_mesh_objects = get_target_mesh_objects(context)
 
     mesh_data = []
     processed_mesh_data = set()
 
-    for obj in selected_mesh_objects:
+    for obj in target_mesh_objects:
         mesh = obj.data
         mesh_key = mesh.as_pointer()
 
@@ -42,7 +58,7 @@ def get_selected_mesh_data(context):
 
 
 def get_common_uv_map_names(context):
-    mesh_data = get_selected_mesh_data(context)
+    mesh_data = get_target_mesh_data(context)
 
     if not mesh_data:
         return []
@@ -68,8 +84,8 @@ def common_uv_map_items(self, context):
         _uv_map_enum_items = [
             (
                 "NONE",
-                "No common UV maps",
-                "Selected mesh objects do not share a UV map name",
+                "No UV maps available",
+                "Target mesh objects do not have a shared UV map name",
             ),
         ]
         return _uv_map_enum_items
@@ -81,7 +97,37 @@ def common_uv_map_items(self, context):
     return _uv_map_enum_items
 
 
+class BATCHOP_PG_object_item(PropertyGroup):
+    object: PointerProperty(
+        name="Object",
+        description="Object to include in batch operations",
+        type=bpy.types.Object,
+    )
+
+
 class BATCHOP_PG_settings(PropertyGroup):
+    object_source: EnumProperty(
+        name="Object Source",
+        description="Choose which objects batch operations should use",
+        items=[
+            (
+                "SELECTED",
+                "Selected",
+                "Use the currently selected objects",
+            ),
+            (
+                "DROP_LIST",
+                "Drop List",
+                "Use the objects in the list below",
+            ),
+        ],
+        default="SELECTED",
+    )
+
+    object_items: CollectionProperty(type=BATCHOP_PG_object_item)
+
+    object_items_index: IntProperty(default=0)
+
     operation: EnumProperty(
         name="Operation",
         description="Choose the batch operation to run",
@@ -127,20 +173,17 @@ class BATCHOP_OT_add_uv_map(Operator):
             self.report({"ERROR"}, "Enter a UV map name.")
             return {"CANCELLED"}
 
-        selected_mesh_objects = [
-            obj for obj in context.selected_objects
-            if obj.type == "MESH"
-        ]
+        target_mesh_objects = get_target_mesh_objects(context)
 
-        if not selected_mesh_objects:
-            self.report({"ERROR"}, "Select at least one mesh object.")
+        if not target_mesh_objects:
+            self.report({"ERROR"}, "Choose at least one mesh object.")
             return {"CANCELLED"}
 
         added_count = 0
         skipped_count = 0
         processed_mesh_data = set()
 
-        for obj in selected_mesh_objects:
+        for obj in target_mesh_objects:
             mesh = obj.data
             mesh_key = mesh.as_pointer()
 
@@ -182,17 +225,17 @@ class BATCHOP_OT_switch_uv_map(Operator):
             self.report({"ERROR"}, "Enter a UV map name.")
             return {"CANCELLED"}
 
-        mesh_data = get_selected_mesh_data(context)
+        mesh_data = get_target_mesh_data(context)
 
         if not mesh_data:
-            self.report({"ERROR"}, "Select at least one mesh object.")
+            self.report({"ERROR"}, "Choose at least one mesh object.")
             return {"CANCELLED"}
 
         common_uv_names = get_common_uv_map_names(context)
         if uv_name == "NONE" or uv_name not in common_uv_names:
             self.report(
                 {"ERROR"},
-                "Selected mesh objects do not share the chosen UV map.",
+                "Target mesh objects do not share the chosen UV map.",
             )
             return {"CANCELLED"}
 
@@ -209,6 +252,82 @@ class BATCHOP_OT_switch_uv_map(Operator):
             f'UV map "{uv_name}" made active and active render on '
             f"{switched_count} mesh data-block(s).",
         )
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_add_object_list_item(Operator):
+    bl_idname = "batch_operation.add_object_list_item"
+    bl_label = "Add Object Slot"
+    bl_description = "Add an empty object slot to the drop list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.batch_operation_settings
+        settings.object_items.add()
+        settings.object_items_index = len(settings.object_items) - 1
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_add_selected_to_object_list(Operator):
+    bl_idname = "batch_operation.add_selected_to_object_list"
+    bl_label = "Add Selected Objects"
+    bl_description = "Add currently selected objects to the drop list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.batch_operation_settings
+        existing_objects = {
+            item.object for item in settings.object_items
+            if item.object is not None
+        }
+
+        added_count = 0
+        for obj in context.selected_objects:
+            if obj in existing_objects:
+                continue
+
+            item = settings.object_items.add()
+            item.object = obj
+            existing_objects.add(obj)
+            added_count += 1
+
+        if added_count == 0:
+            self.report({"INFO"}, "No new selected objects to add.")
+        else:
+            settings.object_items_index = len(settings.object_items) - 1
+            self.report({"INFO"}, f"Added {added_count} object(s) to the drop list.")
+
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_remove_object_list_item(Operator):
+    bl_idname = "batch_operation.remove_object_list_item"
+    bl_label = "Remove Object"
+    bl_description = "Remove the active object from the drop list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.batch_operation_settings
+        index = settings.object_items_index
+
+        if index < 0 or index >= len(settings.object_items):
+            return {"CANCELLED"}
+
+        settings.object_items.remove(index)
+        settings.object_items_index = max(0, min(index, len(settings.object_items) - 1))
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_clear_object_list(Operator):
+    bl_idname = "batch_operation.clear_object_list"
+    bl_label = "Clear Object List"
+    bl_description = "Remove all objects from the drop list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.batch_operation_settings
+        settings.object_items.clear()
+        settings.object_items_index = 0
         return {"FINISHED"}
 
 
@@ -253,6 +372,25 @@ def reload_this_addon():
     return None
 
 
+class BATCHOP_UL_object_list(UIList):
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            layout.prop(item, "object", text="")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="OBJECT_DATA")
+
+
 class BATCHOP_PT_main_panel(Panel):
     bl_label = "Batch Operation"
     bl_idname = "BATCHOP_PT_main_panel"
@@ -265,8 +403,32 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.5.0")
+        layout.label(text="Tool Version: 0.9.0")
         layout.label(text=f"Source: {__file__}")
+        layout.separator()
+
+        layout.prop(settings, "object_source", expand=True)
+
+        if settings.object_source == "DROP_LIST":
+            row = layout.row()
+            row.template_list(
+                "BATCHOP_UL_object_list",
+                "",
+                settings,
+                "object_items",
+                settings,
+                "object_items_index",
+                rows=4,
+            )
+
+            column = row.column(align=True)
+            column.operator("batch_operation.add_object_list_item", text="", icon="ADD")
+            column.operator("batch_operation.remove_object_list_item", text="", icon="REMOVE")
+            column.separator()
+            column.operator("batch_operation.clear_object_list", text="", icon="TRASH")
+
+            layout.operator("batch_operation.add_selected_to_object_list", icon="SELECT_EXTEND")
+
         layout.separator()
         layout.prop(settings, "operation", expand=True)
 
@@ -284,7 +446,7 @@ class BATCHOP_PT_main_panel(Panel):
             if has_common_uv_maps:
                 box.prop(settings, "switch_uv_map_choice")
             else:
-                box.label(text="No common UV maps on selected meshes.", icon="ERROR")
+                box.label(text="No UV maps available on target meshes.", icon="ERROR")
 
             row = box.row()
             row.enabled = has_common_uv_maps
@@ -292,10 +454,16 @@ class BATCHOP_PT_main_panel(Panel):
 
 
 classes = (
+    BATCHOP_PG_object_item,
     BATCHOP_PG_settings,
     BATCHOP_OT_add_uv_map,
     BATCHOP_OT_switch_uv_map,
+    BATCHOP_OT_add_object_list_item,
+    BATCHOP_OT_add_selected_to_object_list,
+    BATCHOP_OT_remove_object_list_item,
+    BATCHOP_OT_clear_object_list,
     BATCHOP_OT_update_addon,
+    BATCHOP_UL_object_list,
     BATCHOP_PT_main_panel,
 )
 
