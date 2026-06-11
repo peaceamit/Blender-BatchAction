@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 2, 0),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -9,8 +9,75 @@ bl_info = {
 }
 
 import bpy
+import importlib
+import sys
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
+
+
+_uv_map_enum_items = []
+
+
+def get_selected_mesh_data(context):
+    selected_mesh_objects = [
+        obj for obj in context.selected_objects
+        if obj.type == "MESH"
+    ]
+
+    mesh_data = []
+    processed_mesh_data = set()
+
+    for obj in selected_mesh_objects:
+        mesh = obj.data
+        mesh_key = mesh.as_pointer()
+
+        if mesh_key in processed_mesh_data:
+            continue
+
+        processed_mesh_data.add(mesh_key)
+        mesh_data.append(mesh)
+
+    return mesh_data
+
+
+def get_common_uv_map_names(context):
+    mesh_data = get_selected_mesh_data(context)
+
+    if not mesh_data:
+        return []
+
+    common_uv_names = {
+        uv_layer.name for uv_layer in mesh_data[0].uv_layers
+    }
+
+    for mesh in mesh_data[1:]:
+        common_uv_names.intersection_update(
+            uv_layer.name for uv_layer in mesh.uv_layers
+        )
+
+    return sorted(common_uv_names)
+
+
+def common_uv_map_items(self, context):
+    global _uv_map_enum_items
+
+    common_uv_names = get_common_uv_map_names(context)
+
+    if not common_uv_names:
+        _uv_map_enum_items = [
+            (
+                "NONE",
+                "No common UV maps",
+                "Selected mesh objects do not share a UV map name",
+            ),
+        ]
+        return _uv_map_enum_items
+
+    _uv_map_enum_items = [
+        (uv_name, uv_name, f'Switch selected meshes to "{uv_name}"')
+        for uv_name in common_uv_names
+    ]
+    return _uv_map_enum_items
 
 
 class BATCHOP_PG_settings(PropertyGroup):
@@ -26,7 +93,7 @@ class BATCHOP_PG_settings(PropertyGroup):
             (
                 "SWITCH_UV_MAP",
                 "Switch UV Map",
-                "Set the named UV map as active on all selected mesh objects",
+                "Set the named UV map as active and active render on all selected mesh objects",
             ),
         ],
         default="ADD_UV_MAP",
@@ -38,10 +105,10 @@ class BATCHOP_PG_settings(PropertyGroup):
         default="UVMap_Second",
     )
 
-    switch_uv_map_name: StringProperty(
+    switch_uv_map_choice: EnumProperty(
         name="UV Map Name",
-        description="Name of the UV map to make active",
-        default="UVMap",
+        description="Common UV map to make active",
+        items=common_uv_map_items,
     )
 
 
@@ -103,58 +170,43 @@ class BATCHOP_OT_add_uv_map(Operator):
 class BATCHOP_OT_switch_uv_map(Operator):
     bl_idname = "batch_operation.switch_uv_map"
     bl_label = "Switch UV Map on Selected Objects"
-    bl_description = "Set the named UV map as active on all selected mesh objects"
+    bl_description = "Set the named UV map as active and active render on all selected mesh objects"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.batch_operation_settings
-        uv_name = settings.switch_uv_map_name.strip()
+        uv_name = settings.switch_uv_map_choice.strip()
 
         if not uv_name:
             self.report({"ERROR"}, "Enter a UV map name.")
             return {"CANCELLED"}
 
-        selected_mesh_objects = [
-            obj for obj in context.selected_objects
-            if obj.type == "MESH"
-        ]
+        mesh_data = get_selected_mesh_data(context)
 
-        if not selected_mesh_objects:
+        if not mesh_data:
             self.report({"ERROR"}, "Select at least one mesh object.")
             return {"CANCELLED"}
 
-        switched_count = 0
-        missing_count = 0
-        processed_mesh_data = set()
-
-        for obj in selected_mesh_objects:
-            mesh = obj.data
-            mesh_key = mesh.as_pointer()
-
-            if mesh_key in processed_mesh_data:
-                continue
-
-            processed_mesh_data.add(mesh_key)
-
-            uv_layer = mesh.uv_layers.get(uv_name)
-            if uv_layer is None:
-                missing_count += 1
-                continue
-
-            mesh.uv_layers.active = uv_layer
-            switched_count += 1
-
-        if switched_count == 0:
+        common_uv_names = get_common_uv_map_names(context)
+        if uv_name == "NONE" or uv_name not in common_uv_names:
             self.report(
-                {"WARNING"},
-                f'No selected mesh data-blocks had UV map "{uv_name}".',
+                {"ERROR"},
+                "Selected mesh objects do not share the chosen UV map.",
             )
             return {"CANCELLED"}
 
+        switched_count = 0
+
+        for mesh in mesh_data:
+            uv_layer = mesh.uv_layers.get(uv_name)
+            mesh.uv_layers.active = uv_layer
+            uv_layer.active_render = True
+            switched_count += 1
+
         self.report(
             {"INFO"},
-            f'UV map "{uv_name}" made active on {switched_count} mesh data-block(s); '
-            f"{missing_count} did not have it.",
+            f'UV map "{uv_name}" made active and active render on '
+            f"{switched_count} mesh data-block(s).",
         )
         return {"FINISHED"}
 
@@ -162,19 +214,27 @@ class BATCHOP_OT_switch_uv_map(Operator):
 class BATCHOP_OT_update_addon(Operator):
     bl_idname = "batch_operation.update_addon"
     bl_label = "Update Tool"
-    bl_description = "Reload Blender scripts so this add-on uses the latest file changes"
+    bl_description = "Reload this add-on from the latest file changes"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         self.report({"INFO"}, "Reloading Batch Operation tool...")
-        bpy.app.timers.register(reload_addon_scripts, first_interval=0.1)
+        bpy.app.timers.register(reload_this_addon, first_interval=0.1)
 
         return {"FINISHED"}
 
 
-def reload_addon_scripts():
+def reload_this_addon():
+    module_name = __name__
+
     try:
-        bpy.ops.script.reload()
+        module = sys.modules.get(module_name)
+        if module is None:
+            return None
+
+        module.unregister()
+        module = importlib.reload(module)
+        module.register()
     except Exception as exc:
         print(f"Batch Operation update failed: {exc}")
 
@@ -192,8 +252,8 @@ class BATCHOP_PT_main_panel(Panel):
         layout = self.layout
         settings = context.scene.batch_operation_settings
 
-        layout.label(text="Version 0.2.0")
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
+        layout.label(text="Tool Version: 0.4.0")
         layout.separator()
         layout.prop(settings, "operation", expand=True)
 
@@ -203,10 +263,19 @@ class BATCHOP_PT_main_panel(Panel):
             box.prop(settings, "new_uv_map_name")
             box.operator("batch_operation.add_uv_map", icon="GROUP_UVS")
         elif settings.operation == "SWITCH_UV_MAP":
+            common_uv_names = get_common_uv_map_names(context)
+            has_common_uv_maps = len(common_uv_names) > 0
+
             box = layout.box()
             box.label(text="Switch UV Map")
-            box.prop(settings, "switch_uv_map_name")
-            box.operator("batch_operation.switch_uv_map", icon="GROUP_UVS")
+            if has_common_uv_maps:
+                box.prop(settings, "switch_uv_map_choice")
+            else:
+                box.label(text="No common UV maps on selected meshes.", icon="ERROR")
+
+            row = box.row()
+            row.enabled = has_common_uv_maps
+            row.operator("batch_operation.switch_uv_map", icon="GROUP_UVS")
 
 
 classes = (
