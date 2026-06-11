@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 import importlib
 import sys
+import types
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
@@ -232,9 +233,20 @@ def reload_this_addon():
         if module is None:
             return None
 
+        module_path = getattr(module, "__file__", __file__)
+        importlib.invalidate_caches()
         module.unregister()
-        module = importlib.reload(module)
-        module.register()
+
+        with open(module_path, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        new_module = types.ModuleType(module_name)
+        new_module.__file__ = module_path
+        new_module.__package__ = getattr(module, "__package__", None)
+        sys.modules[module_name] = new_module
+
+        exec(compile(source, module_path, "exec"), new_module.__dict__)
+        new_module.register()
     except Exception as exc:
         print(f"Batch Operation update failed: {exc}")
 
@@ -253,7 +265,8 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.4.0")
+        layout.label(text="Tool Version: 0.5.0")
+        layout.label(text=f"Source: {__file__}")
         layout.separator()
         layout.prop(settings, "operation", expand=True)
 
