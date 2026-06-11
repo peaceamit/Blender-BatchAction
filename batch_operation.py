@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 11, 0),
-    "blender": (4, 0, 0),
+    "version": (0, 14, 0),
+    "blender": (5, 1, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
     "category": "Object",
@@ -17,6 +17,7 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 
 _uv_map_enum_items = []
+PREVIEW_MATERIAL_NAME = "PreviewMaterial"
 
 
 def get_target_objects(context):
@@ -73,6 +74,30 @@ def get_common_uv_map_names(context):
         )
 
     return sorted(common_uv_names)
+
+
+def get_preview_material():
+    material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
+
+    if material is None:
+        material = bpy.data.materials.new(PREVIEW_MATERIAL_NAME)
+        material.diffuse_color = (1.0, 0.35, 0.0, 1.0)
+
+    material.use_fake_user = True
+    return material
+
+
+def supports_material_override(context):
+    return hasattr(context.view_layer, "material_override")
+
+
+def is_preview_material_override_active(context):
+    if not supports_material_override(context):
+        return False
+
+    return context.view_layer.material_override == bpy.data.materials.get(
+        PREVIEW_MATERIAL_NAME
+    )
 
 
 def common_uv_map_items(self, context):
@@ -367,12 +392,59 @@ class BATCHOP_OT_open_uv_editor(Operator):
         bpy.ops.mesh.select_mode(type="FACE")
         bpy.ops.mesh.select_all(action="SELECT")
 
-        context.area.ui_type = "UV"
+        if context.area is not None:
+            context.area.ui_type = "UV"
 
         self.report(
             {"INFO"},
             f"Opened {len(target_mesh_objects)} mesh object(s) in the UV Editor.",
         )
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_apply_preview_material(Operator):
+    bl_idname = "batch_operation.apply_preview_material"
+    bl_label = "Change Material"
+    bl_description = "Non-destructively preview the current view layer with PreviewMaterial"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if not supports_material_override(context):
+            self.report({"ERROR"}, "This Blender context does not support material override.")
+            return {"CANCELLED"}
+
+        preview_material = get_preview_material()
+        current_override = context.view_layer.material_override
+
+        if current_override is not None and current_override != preview_material:
+            self.report(
+                {"ERROR"},
+                f'Current view layer already uses override "{current_override.name}".',
+            )
+            return {"CANCELLED"}
+
+        context.view_layer.material_override = preview_material
+        self.report({"INFO"}, f"Enabled {PREVIEW_MATERIAL_NAME} view layer override.")
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_revert_preview_material(Operator):
+    bl_idname = "batch_operation.revert_preview_material"
+    bl_label = "Revert Material"
+    bl_description = "Clear the PreviewMaterial view layer override"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if not supports_material_override(context):
+            self.report({"ERROR"}, "This Blender context does not support material override.")
+            return {"CANCELLED"}
+
+        if not is_preview_material_override_active(context):
+            self.report({"WARNING"}, f"{PREVIEW_MATERIAL_NAME} override is not active.")
+            return {"CANCELLED"}
+
+        context.view_layer.material_override = None
+        self.report({"INFO"}, f"Cleared {PREVIEW_MATERIAL_NAME} view layer override.")
         return {"FINISHED"}
 
 
@@ -524,7 +596,7 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.11.0")
+        layout.label(text="Tool Version: 0.14.0")
         layout.label(text=f"Source: {__file__}")
         layout.separator()
 
@@ -600,6 +672,31 @@ class BATCHOP_PT_main_panel(Panel):
             row.enabled = has_mesh_objects
             row.operator("batch_operation.open_uv_editor", icon="UV")
 
+        layout.separator()
+
+        can_use_material_override = supports_material_override(context)
+        preview_override_active = is_preview_material_override_active(context)
+
+        material_box = layout.box()
+        material_box.label(text="Material Switcher")
+        material_box.label(text=f"Preview: {PREVIEW_MATERIAL_NAME}")
+        material_box.label(text="Mode: View layer override")
+
+        row = material_box.row(align=True)
+        row.enabled = can_use_material_override and not preview_override_active
+        row.operator("batch_operation.apply_preview_material", icon="MATERIAL")
+
+        row = material_box.row(align=True)
+        row.enabled = can_use_material_override and preview_override_active
+        row.operator("batch_operation.revert_preview_material", icon="FILE_REFRESH")
+
+        if not can_use_material_override:
+            material_box.label(text="Material override is unavailable here.", icon="ERROR")
+        elif preview_override_active:
+            material_box.label(text="Preview override is active.", icon="INFO")
+        else:
+            material_box.label(text="Real material assignments are untouched.", icon="INFO")
+
 
 classes = (
     BATCHOP_PG_object_item,
@@ -608,6 +705,8 @@ classes = (
     BATCHOP_OT_switch_uv_map,
     BATCHOP_OT_rename_uv_map,
     BATCHOP_OT_open_uv_editor,
+    BATCHOP_OT_apply_preview_material,
+    BATCHOP_OT_revert_preview_material,
     BATCHOP_OT_add_object_list_item,
     BATCHOP_OT_add_selected_to_object_list,
     BATCHOP_OT_remove_object_list_item,
@@ -628,10 +727,14 @@ def register():
 
 
 def unregister():
-    del bpy.types.Scene.batch_operation_settings
+    if hasattr(bpy.types.Scene, "batch_operation_settings"):
+        del bpy.types.Scene.batch_operation_settings
 
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
