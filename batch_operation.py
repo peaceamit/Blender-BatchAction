@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 14, 0),
+    "version": (0, 22, 0),
     "blender": (5, 1, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -9,15 +9,15 @@ bl_info = {
 }
 
 import bpy
-import importlib
 import sys
-import types
 from bpy.props import CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 
 _uv_map_enum_items = []
 PREVIEW_MATERIAL_NAME = "PreviewMaterial"
+PREVIEW_OVERRIDE_FLAG = "batch_operation_preview_override_active"
+PREVIEW_LOCAL_VIEW_FLAG = "batch_operation_preview_local_view_active"
 
 
 def get_target_objects(context):
@@ -76,6 +76,17 @@ def get_common_uv_map_names(context):
     return sorted(common_uv_names)
 
 
+def redraw_view3d_areas(context):
+    screen = context.screen
+
+    if screen is None:
+        return
+
+    for area in screen.areas:
+        if area.type == "VIEW_3D":
+            area.tag_redraw()
+
+
 def get_preview_material():
     material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
 
@@ -95,9 +106,50 @@ def is_preview_material_override_active(context):
     if not supports_material_override(context):
         return False
 
-    return context.view_layer.material_override == bpy.data.materials.get(
-        PREVIEW_MATERIAL_NAME
-    )
+    preview_material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
+
+    if preview_material is None:
+        return False
+
+    return context.view_layer.material_override == preview_material
+
+
+def get_current_material_override(context):
+    if not supports_material_override(context):
+        return None
+
+    return context.view_layer.material_override
+
+
+def get_view3d_space(context):
+    if context.area is None or context.area.type != "VIEW_3D":
+        return None
+
+    return context.space_data
+
+
+def set_material_preview_viewport(context):
+    space = get_view3d_space(context)
+
+    if space is None:
+        return
+
+    space.shading.type = "MATERIAL"
+
+
+def set_target_local_view(context, target_objects, state):
+    space = get_view3d_space(context)
+
+    if space is None:
+        return False
+
+    try:
+        for obj in context.scene.objects:
+            obj.local_view_set(space, obj in target_objects if state else False)
+    except Exception:
+        return False
+
+    return True
 
 
 def common_uv_map_items(self, context):
@@ -402,13 +454,31 @@ class BATCHOP_OT_open_uv_editor(Operator):
         return {"FINISHED"}
 
 
+class BATCHOP_OT_refresh_targets(Operator):
+    bl_idname = "batch_operation.refresh_targets"
+    bl_label = "Refresh Targets"
+    bl_description = "Refresh target object and UV map dropdowns"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        redraw_view3d_areas(context)
+        self.report({"INFO"}, "Batch Operation targets refreshed.")
+        return {"FINISHED"}
+
+
 class BATCHOP_OT_apply_preview_material(Operator):
     bl_idname = "batch_operation.apply_preview_material"
     bl_label = "Change Material"
-    bl_description = "Non-destructively preview the current view layer with PreviewMaterial"
+    bl_description = "Preview target objects with PreviewMaterial without changing mesh materials"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        target_mesh_objects = get_target_mesh_objects(context)
+
+        if not target_mesh_objects:
+            self.report({"ERROR"}, "Choose at least one mesh object.")
+            return {"CANCELLED"}
+
         if not supports_material_override(context):
             self.report({"ERROR"}, "This Blender context does not support material override.")
             return {"CANCELLED"}
@@ -423,15 +493,35 @@ class BATCHOP_OT_apply_preview_material(Operator):
             )
             return {"CANCELLED"}
 
+        if context.object is not None and context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        bpy.ops.object.select_all(action="DESELECT")
+
+        for obj in target_mesh_objects:
+            obj.select_set(True)
+
+        context.view_layer.objects.active = target_mesh_objects[0]
         context.view_layer.material_override = preview_material
-        self.report({"INFO"}, f"Enabled {PREVIEW_MATERIAL_NAME} view layer override.")
+        context.scene[PREVIEW_OVERRIDE_FLAG] = True
+        context.scene[PREVIEW_LOCAL_VIEW_FLAG] = set_target_local_view(
+            context,
+            set(target_mesh_objects),
+            True,
+        )
+        set_material_preview_viewport(context)
+
+        self.report(
+            {"INFO"},
+            f"Preview override enabled for viewing {len(target_mesh_objects)} target object(s).",
+        )
         return {"FINISHED"}
 
 
 class BATCHOP_OT_revert_preview_material(Operator):
     bl_idname = "batch_operation.revert_preview_material"
     bl_label = "Revert Material"
-    bl_description = "Clear the PreviewMaterial view layer override"
+    bl_description = "Clear the PreviewMaterial viewport override"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -440,11 +530,16 @@ class BATCHOP_OT_revert_preview_material(Operator):
             return {"CANCELLED"}
 
         if not is_preview_material_override_active(context):
+            context.scene[PREVIEW_OVERRIDE_FLAG] = False
             self.report({"WARNING"}, f"{PREVIEW_MATERIAL_NAME} override is not active.")
             return {"CANCELLED"}
 
         context.view_layer.material_override = None
-        self.report({"INFO"}, f"Cleared {PREVIEW_MATERIAL_NAME} view layer override.")
+        context.scene[PREVIEW_OVERRIDE_FLAG] = False
+        if context.scene.get(PREVIEW_LOCAL_VIEW_FLAG, False):
+            set_target_local_view(context, set(), False)
+            context.scene[PREVIEW_LOCAL_VIEW_FLAG] = False
+        self.report({"INFO"}, f"Cleared {PREVIEW_MATERIAL_NAME} viewport override.")
         return {"FINISHED"}
 
 
@@ -458,6 +553,7 @@ class BATCHOP_OT_add_object_list_item(Operator):
         settings = context.scene.batch_operation_settings
         settings.object_items.add()
         settings.object_items_index = len(settings.object_items) - 1
+        redraw_view3d_areas(context)
         return {"FINISHED"}
 
 
@@ -490,6 +586,7 @@ class BATCHOP_OT_add_selected_to_object_list(Operator):
             settings.object_items_index = len(settings.object_items) - 1
             self.report({"INFO"}, f"Added {added_count} object(s) to the drop list.")
 
+        redraw_view3d_areas(context)
         return {"FINISHED"}
 
 
@@ -508,6 +605,7 @@ class BATCHOP_OT_remove_object_list_item(Operator):
 
         settings.object_items.remove(index)
         settings.object_items_index = max(0, min(index, len(settings.object_items) - 1))
+        redraw_view3d_areas(context)
         return {"FINISHED"}
 
 
@@ -521,6 +619,7 @@ class BATCHOP_OT_clear_object_list(Operator):
         settings = context.scene.batch_operation_settings
         settings.object_items.clear()
         settings.object_items_index = 0
+        redraw_view3d_areas(context)
         return {"FINISHED"}
 
 
@@ -543,22 +642,18 @@ def reload_this_addon():
     try:
         module = sys.modules.get(module_name)
         if module is None:
+            print(f"Batch Operation update failed: module {module_name} was not found.")
             return None
 
         module_path = getattr(module, "__file__", __file__)
-        importlib.invalidate_caches()
         module.unregister()
 
         with open(module_path, "r", encoding="utf-8") as source_file:
             source = source_file.read()
 
-        new_module = types.ModuleType(module_name)
-        new_module.__file__ = module_path
-        new_module.__package__ = getattr(module, "__package__", None)
-        sys.modules[module_name] = new_module
-
-        exec(compile(source, module_path, "exec"), new_module.__dict__)
-        new_module.register()
+        exec(compile(source, module_path, "exec"), module.__dict__)
+        module.register()
+        print(f"Batch Operation updated from: {module_path}")
     except Exception as exc:
         print(f"Batch Operation update failed: {exc}")
 
@@ -596,11 +691,13 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.14.0")
+        layout.label(text="Tool Version: 0.22.0")
         layout.label(text=f"Source: {__file__}")
         layout.separator()
 
-        layout.prop(settings, "object_source", expand=True)
+        row = layout.row(align=True)
+        row.prop(settings, "object_source", expand=True)
+        row.operator("batch_operation.refresh_targets", text="", icon="FILE_REFRESH")
 
         if settings.object_source == "DROP_LIST":
             row = layout.row()
@@ -674,28 +771,46 @@ class BATCHOP_PT_main_panel(Panel):
 
         layout.separator()
 
+        target_mesh_objects = get_target_mesh_objects(context)
+        has_mesh_objects = len(target_mesh_objects) > 0
         can_use_material_override = supports_material_override(context)
         preview_override_active = is_preview_material_override_active(context)
+        current_material_override = get_current_material_override(context)
+        other_override_active = (
+            current_material_override is not None and not preview_override_active
+        )
 
         material_box = layout.box()
         material_box.label(text="Material Switcher")
-        material_box.label(text=f"Preview: {PREVIEW_MATERIAL_NAME}")
-        material_box.label(text="Mode: View layer override")
+        material_box.label(text=f"Preview override: {PREVIEW_MATERIAL_NAME}")
+        material_box.label(text="Mode: View layer material override")
 
         row = material_box.row(align=True)
-        row.enabled = can_use_material_override and not preview_override_active
+        row.enabled = (
+            has_mesh_objects
+            and can_use_material_override
+            and not preview_override_active
+            and not other_override_active
+        )
         row.operator("batch_operation.apply_preview_material", icon="MATERIAL")
 
         row = material_box.row(align=True)
         row.enabled = can_use_material_override and preview_override_active
         row.operator("batch_operation.revert_preview_material", icon="FILE_REFRESH")
 
-        if not can_use_material_override:
+        if not has_mesh_objects:
+            material_box.label(text="No target mesh objects available.", icon="ERROR")
+        elif not can_use_material_override:
             material_box.label(text="Material override is unavailable here.", icon="ERROR")
         elif preview_override_active:
             material_box.label(text="Preview override is active.", icon="INFO")
+        elif other_override_active:
+            material_box.label(
+                text=f'View layer already overrides with "{current_material_override.name}".',
+                icon="ERROR",
+            )
         else:
-            material_box.label(text="Real material assignments are untouched.", icon="INFO")
+            material_box.label(text="Mesh material assignments are never changed.", icon="INFO")
 
 
 classes = (
@@ -705,6 +820,7 @@ classes = (
     BATCHOP_OT_switch_uv_map,
     BATCHOP_OT_rename_uv_map,
     BATCHOP_OT_open_uv_editor,
+    BATCHOP_OT_refresh_targets,
     BATCHOP_OT_apply_preview_material,
     BATCHOP_OT_revert_preview_material,
     BATCHOP_OT_add_object_list_item,
