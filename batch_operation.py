@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 9, 0),
+    "version": (0, 11, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -142,6 +142,16 @@ class BATCHOP_PG_settings(PropertyGroup):
                 "Switch UV Map",
                 "Set the named UV map as active and active render on all selected mesh objects",
             ),
+            (
+                "RENAME_UV_MAP",
+                "Rename UV Map",
+                "Rename a shared UV map on all target mesh objects",
+            ),
+            (
+                "OPEN_UV_EDITOR",
+                "Open UV Editor",
+                "Open the target mesh objects in UV edit mode",
+            ),
         ],
         default="ADD_UV_MAP",
     )
@@ -156,6 +166,18 @@ class BATCHOP_PG_settings(PropertyGroup):
         name="UV Map Name",
         description="Common UV map to make active",
         items=common_uv_map_items,
+    )
+
+    rename_uv_map_choice: EnumProperty(
+        name="Current UV Map",
+        description="Common UV map to rename",
+        items=common_uv_map_items,
+    )
+
+    rename_uv_map_name: StringProperty(
+        name="New UV Map Name",
+        description="New name for the chosen UV map",
+        default="UVMap_Renamed",
     )
 
 
@@ -251,6 +273,105 @@ class BATCHOP_OT_switch_uv_map(Operator):
             {"INFO"},
             f'UV map "{uv_name}" made active and active render on '
             f"{switched_count} mesh data-block(s).",
+        )
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_rename_uv_map(Operator):
+    bl_idname = "batch_operation.rename_uv_map"
+    bl_label = "Rename UV Map on Target Objects"
+    bl_description = "Rename a shared UV map on all target mesh objects"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.batch_operation_settings
+        old_uv_name = settings.rename_uv_map_choice.strip()
+        new_uv_name = settings.rename_uv_map_name.strip()
+
+        if not old_uv_name or old_uv_name == "NONE":
+            self.report({"ERROR"}, "Choose a UV map to rename.")
+            return {"CANCELLED"}
+
+        if not new_uv_name:
+            self.report({"ERROR"}, "Enter a new UV map name.")
+            return {"CANCELLED"}
+
+        mesh_data = get_target_mesh_data(context)
+
+        if not mesh_data:
+            self.report({"ERROR"}, "Choose at least one mesh object.")
+            return {"CANCELLED"}
+
+        common_uv_names = get_common_uv_map_names(context)
+        if old_uv_name not in common_uv_names:
+            self.report(
+                {"ERROR"},
+                "Target mesh objects do not share the chosen UV map.",
+            )
+            return {"CANCELLED"}
+
+        if old_uv_name == new_uv_name:
+            self.report({"INFO"}, "UV map already has that name.")
+            return {"FINISHED"}
+
+        for mesh in mesh_data:
+            existing_uv_layer = mesh.uv_layers.get(new_uv_name)
+            old_uv_layer = mesh.uv_layers.get(old_uv_name)
+
+            if existing_uv_layer is not None and existing_uv_layer != old_uv_layer:
+                self.report(
+                    {"ERROR"},
+                    f'Cannot rename: "{new_uv_name}" already exists on "{mesh.name}".',
+                )
+                return {"CANCELLED"}
+
+        renamed_count = 0
+
+        for mesh in mesh_data:
+            mesh.uv_layers[old_uv_name].name = new_uv_name
+            renamed_count += 1
+
+        self.report(
+            {"INFO"},
+            f'UV map "{old_uv_name}" renamed to "{new_uv_name}" on '
+            f"{renamed_count} mesh data-block(s).",
+        )
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_open_uv_editor(Operator):
+    bl_idname = "batch_operation.open_uv_editor"
+    bl_label = "Open UV Editor with Target Objects"
+    bl_description = "Select target mesh objects and open them in UV edit mode"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        target_mesh_objects = get_target_mesh_objects(context)
+
+        if not target_mesh_objects:
+            self.report({"ERROR"}, "Choose at least one mesh object.")
+            return {"CANCELLED"}
+
+        active_object = target_mesh_objects[0]
+
+        if context.object is not None and context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        bpy.ops.object.select_all(action="DESELECT")
+
+        for obj in target_mesh_objects:
+            obj.select_set(True)
+
+        context.view_layer.objects.active = active_object
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_mode(type="FACE")
+        bpy.ops.mesh.select_all(action="SELECT")
+
+        context.area.ui_type = "UV"
+
+        self.report(
+            {"INFO"},
+            f"Opened {len(target_mesh_objects)} mesh object(s) in the UV Editor.",
         )
         return {"FINISHED"}
 
@@ -403,7 +524,7 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.9.0")
+        layout.label(text="Tool Version: 0.11.0")
         layout.label(text=f"Source: {__file__}")
         layout.separator()
 
@@ -451,6 +572,33 @@ class BATCHOP_PT_main_panel(Panel):
             row = box.row()
             row.enabled = has_common_uv_maps
             row.operator("batch_operation.switch_uv_map", icon="GROUP_UVS")
+        elif settings.operation == "RENAME_UV_MAP":
+            common_uv_names = get_common_uv_map_names(context)
+            has_common_uv_maps = len(common_uv_names) > 0
+
+            box = layout.box()
+            box.label(text="Rename UV Map")
+            if has_common_uv_maps:
+                box.prop(settings, "rename_uv_map_choice")
+                box.prop(settings, "rename_uv_map_name")
+            else:
+                box.label(text="No UV maps available on target meshes.", icon="ERROR")
+
+            row = box.row()
+            row.enabled = has_common_uv_maps
+            row.operator("batch_operation.rename_uv_map", icon="GREASEPENCIL")
+        elif settings.operation == "OPEN_UV_EDITOR":
+            target_mesh_objects = get_target_mesh_objects(context)
+            has_mesh_objects = len(target_mesh_objects) > 0
+
+            box = layout.box()
+            box.label(text="Open UV Editor")
+            if not has_mesh_objects:
+                box.label(text="No target mesh objects available.", icon="ERROR")
+
+            row = box.row()
+            row.enabled = has_mesh_objects
+            row.operator("batch_operation.open_uv_editor", icon="UV")
 
 
 classes = (
@@ -458,6 +606,8 @@ classes = (
     BATCHOP_PG_settings,
     BATCHOP_OT_add_uv_map,
     BATCHOP_OT_switch_uv_map,
+    BATCHOP_OT_rename_uv_map,
+    BATCHOP_OT_open_uv_editor,
     BATCHOP_OT_add_object_list_item,
     BATCHOP_OT_add_selected_to_object_list,
     BATCHOP_OT_remove_object_list_item,
