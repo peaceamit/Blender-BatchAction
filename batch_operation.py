@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Batch Operation",
     "author": "ThumbSword Studio",
-    "version": (0, 22, 0),
+    "version": (0, 30, 0),
     "blender": (5, 1, 0),
     "location": "3D Viewport > Sidebar > Batch Operation",
     "description": "Run repeatable operations on selected mesh objects",
@@ -15,9 +15,10 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 
 _uv_map_enum_items = []
-PREVIEW_MATERIAL_NAME = "PreviewMaterial"
+_target_uv_map_enum_items = []
 PREVIEW_OVERRIDE_FLAG = "batch_operation_preview_override_active"
 PREVIEW_LOCAL_VIEW_FLAG = "batch_operation_preview_local_view_active"
+_material_enum_items = []
 
 
 def get_target_objects(context):
@@ -76,6 +77,85 @@ def get_common_uv_map_names(context):
     return sorted(common_uv_names)
 
 
+def get_target_uv_map_names(context):
+    uv_names = set()
+
+    for mesh in get_target_mesh_data(context):
+        uv_names.update(uv_layer.name for uv_layer in mesh.uv_layers)
+
+    return sorted(uv_names)
+
+
+def get_uv_map_removal_impact(context, uv_name):
+    target_mesh_objects = get_target_mesh_objects(context)
+    impacted_objects = [
+        obj for obj in target_mesh_objects
+        if obj.data.uv_layers.get(uv_name) is not None
+    ]
+
+    impacted_mesh_data = []
+    processed_mesh_data = set()
+
+    for obj in impacted_objects:
+        mesh = obj.data
+        mesh_key = mesh.as_pointer()
+
+        if mesh_key in processed_mesh_data:
+            continue
+
+        processed_mesh_data.add(mesh_key)
+        impacted_mesh_data.append(mesh)
+
+    return impacted_objects, impacted_mesh_data
+
+
+def get_material_removal_impact(context):
+    target_mesh_objects = get_target_mesh_objects(context)
+    impacted_objects = [
+        obj for obj in target_mesh_objects
+        if len(obj.data.materials) > 0
+    ]
+
+    impacted_mesh_data = []
+    processed_mesh_data = set()
+
+    for obj in impacted_objects:
+        mesh = obj.data
+        mesh_key = mesh.as_pointer()
+
+        if mesh_key in processed_mesh_data:
+            continue
+
+        processed_mesh_data.add(mesh_key)
+        impacted_mesh_data.append(mesh)
+
+    return impacted_objects, impacted_mesh_data
+
+
+def snapshot_material_assignments(mesh_objects):
+    snapshot = {}
+
+    for obj in mesh_objects:
+        mesh = obj.data
+        snapshot[obj.as_pointer()] = {
+            "active_material": obj.active_material.as_pointer()
+            if obj.active_material is not None else None,
+            "material_slots": [
+                slot.material.as_pointer() if slot.material is not None else None
+                for slot in obj.material_slots
+            ],
+            "mesh_materials": [
+                material.as_pointer() if material is not None else None
+                for material in mesh.materials
+            ],
+            "polygon_indices": [
+                polygon.material_index for polygon in mesh.polygons
+            ],
+        }
+
+    return snapshot
+
+
 def redraw_view3d_areas(context):
     screen = context.screen
 
@@ -87,15 +167,40 @@ def redraw_view3d_areas(context):
             area.tag_redraw()
 
 
-def get_preview_material():
-    material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
+def get_material_names():
+    return sorted(material.name for material in bpy.data.materials)
 
-    if material is None:
-        material = bpy.data.materials.new(PREVIEW_MATERIAL_NAME)
-        material.diffuse_color = (1.0, 0.35, 0.0, 1.0)
 
-    material.use_fake_user = True
-    return material
+def material_items(self, context):
+    global _material_enum_items
+
+    material_names = get_material_names()
+
+    if not material_names:
+        _material_enum_items = [
+            (
+                "NONE",
+                "No materials available",
+                "Create or import a material before using material preview",
+            ),
+        ]
+        return _material_enum_items
+
+    _material_enum_items = [
+        (material_name, material_name, f'Preview with "{material_name}"')
+        for material_name in material_names
+    ]
+    return _material_enum_items
+
+
+def get_preview_material(context):
+    settings = context.scene.batch_operation_settings
+    material_name = settings.preview_material_choice
+
+    if not material_name or material_name == "NONE":
+        return None
+
+    return bpy.data.materials.get(material_name)
 
 
 def supports_material_override(context):
@@ -106,12 +211,9 @@ def is_preview_material_override_active(context):
     if not supports_material_override(context):
         return False
 
-    preview_material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
-
-    if preview_material is None:
-        return False
-
-    return context.view_layer.material_override == preview_material
+    return bool(context.scene.get(PREVIEW_OVERRIDE_FLAG, False)) and (
+        context.view_layer.material_override is not None
+    )
 
 
 def get_current_material_override(context):
@@ -174,6 +276,28 @@ def common_uv_map_items(self, context):
     return _uv_map_enum_items
 
 
+def target_uv_map_items(self, context):
+    global _target_uv_map_enum_items
+
+    uv_names = get_target_uv_map_names(context)
+
+    if not uv_names:
+        _target_uv_map_enum_items = [
+            (
+                "NONE",
+                "No UV maps available",
+                "Target mesh objects do not have UV maps",
+            ),
+        ]
+        return _target_uv_map_enum_items
+
+    _target_uv_map_enum_items = [
+        (uv_name, uv_name, f'Remove "{uv_name}" from target meshes')
+        for uv_name in uv_names
+    ]
+    return _target_uv_map_enum_items
+
+
 class BATCHOP_PG_object_item(PropertyGroup):
     object: PointerProperty(
         name="Object",
@@ -229,6 +353,16 @@ class BATCHOP_PG_settings(PropertyGroup):
                 "Open UV Editor",
                 "Open the target mesh objects in UV edit mode",
             ),
+            (
+                "REMOVE_UV_MAP",
+                "Remove UV Map",
+                "Remove a named UV map from target mesh objects",
+            ),
+            (
+                "REMOVE_ALL_MATERIALS",
+                "Remove All Materials",
+                "Remove all material slots from target mesh objects",
+            ),
         ],
         default="ADD_UV_MAP",
     )
@@ -255,6 +389,18 @@ class BATCHOP_PG_settings(PropertyGroup):
         name="New UV Map Name",
         description="New name for the chosen UV map",
         default="UVMap_Renamed",
+    )
+
+    remove_uv_map_choice: EnumProperty(
+        name="UV Map Name",
+        description="UV map to remove from target mesh objects",
+        items=target_uv_map_items,
+    )
+
+    preview_material_choice: EnumProperty(
+        name="Preview Material",
+        description="Material to use as a view-only preview override",
+        items=material_items,
     )
 
 
@@ -454,6 +600,122 @@ class BATCHOP_OT_open_uv_editor(Operator):
         return {"FINISHED"}
 
 
+class BATCHOP_OT_remove_uv_map(Operator):
+    bl_idname = "batch_operation.remove_uv_map"
+    bl_label = "Remove UV Map from Target Objects"
+    bl_description = "Remove a named UV map from target mesh objects after confirmation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def get_remove_uv_name(self, context):
+        settings = context.scene.batch_operation_settings
+        return settings.remove_uv_map_choice.strip()
+
+    def draw(self, context):
+        layout = self.layout
+        uv_name = self.get_remove_uv_name(context)
+        impacted_objects, impacted_mesh_data = get_uv_map_removal_impact(context, uv_name)
+
+        layout.label(text=f'Remove UV map "{uv_name}"?')
+        layout.label(text=f"Objects impacted: {len(impacted_objects)}")
+        layout.label(text=f"Mesh data-blocks changed: {len(impacted_mesh_data)}")
+
+    def invoke(self, context, event):
+        uv_name = self.get_remove_uv_name(context)
+
+        if not uv_name or uv_name == "NONE":
+            self.report({"ERROR"}, "Choose a UV map to remove.")
+            return {"CANCELLED"}
+
+        impacted_objects, impacted_mesh_data = get_uv_map_removal_impact(context, uv_name)
+
+        if not impacted_objects:
+            self.report({"ERROR"}, f'No target objects have UV map "{uv_name}".')
+            return {"CANCELLED"}
+
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        uv_name = self.get_remove_uv_name(context)
+
+        if not uv_name or uv_name == "NONE":
+            self.report({"ERROR"}, "Choose a UV map to remove.")
+            return {"CANCELLED"}
+
+        impacted_objects, impacted_mesh_data = get_uv_map_removal_impact(context, uv_name)
+
+        if not impacted_mesh_data:
+            self.report({"ERROR"}, f'No target mesh data-blocks have UV map "{uv_name}".')
+            return {"CANCELLED"}
+
+        removed_count = 0
+
+        for mesh in impacted_mesh_data:
+            uv_layer = mesh.uv_layers.get(uv_name)
+
+            if uv_layer is None:
+                continue
+
+            mesh.uv_layers.remove(uv_layer)
+            removed_count += 1
+
+        redraw_view3d_areas(context)
+        self.report(
+            {"INFO"},
+            f'Removed UV map "{uv_name}" from {len(impacted_objects)} object(s) '
+            f"and {removed_count} mesh data-block(s).",
+        )
+        return {"FINISHED"}
+
+
+class BATCHOP_OT_remove_all_materials(Operator):
+    bl_idname = "batch_operation.remove_all_materials"
+    bl_label = "Remove All Materials from Target Objects"
+    bl_description = "Remove all material slots from target mesh objects after confirmation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def draw(self, context):
+        layout = self.layout
+        impacted_objects, impacted_mesh_data = get_material_removal_impact(context)
+
+        layout.label(text="Remove all materials from target objects?")
+        layout.label(text=f"Objects impacted: {len(impacted_objects)}")
+        layout.label(text=f"Mesh data-blocks changed: {len(impacted_mesh_data)}")
+
+    def invoke(self, context, event):
+        impacted_objects, impacted_mesh_data = get_material_removal_impact(context)
+
+        if not impacted_objects:
+            self.report({"ERROR"}, "No target mesh objects have materials.")
+            return {"CANCELLED"}
+
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        impacted_objects, impacted_mesh_data = get_material_removal_impact(context)
+
+        if not impacted_mesh_data:
+            self.report({"ERROR"}, "No target mesh data-blocks have materials.")
+            return {"CANCELLED"}
+
+        removed_count = 0
+
+        for mesh in impacted_mesh_data:
+            mesh.materials.clear()
+
+            for polygon in mesh.polygons:
+                polygon.material_index = 0
+
+            removed_count += 1
+
+        redraw_view3d_areas(context)
+        self.report(
+            {"INFO"},
+            f"Removed all materials from {len(impacted_objects)} object(s) "
+            f"and {removed_count} mesh data-block(s).",
+        )
+        return {"FINISHED"}
+
+
 class BATCHOP_OT_refresh_targets(Operator):
     bl_idname = "batch_operation.refresh_targets"
     bl_label = "Refresh Targets"
@@ -469,21 +731,23 @@ class BATCHOP_OT_refresh_targets(Operator):
 class BATCHOP_OT_apply_preview_material(Operator):
     bl_idname = "batch_operation.apply_preview_material"
     bl_label = "Change Material"
-    bl_description = "Preview target objects with PreviewMaterial without changing mesh materials"
+    bl_description = "Preview target objects with the selected material without changing mesh materials"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         target_mesh_objects = get_target_mesh_objects(context)
-
-        if not target_mesh_objects:
-            self.report({"ERROR"}, "Choose at least one mesh object.")
-            return {"CANCELLED"}
+        material_snapshot = snapshot_material_assignments(target_mesh_objects)
 
         if not supports_material_override(context):
             self.report({"ERROR"}, "This Blender context does not support material override.")
             return {"CANCELLED"}
 
-        preview_material = get_preview_material()
+        preview_material = get_preview_material(context)
+
+        if preview_material is None:
+            self.report({"ERROR"}, "Choose a preview material.")
+            return {"CANCELLED"}
+
         current_override = context.view_layer.material_override
 
         if current_override is not None and current_override != preview_material:
@@ -493,35 +757,55 @@ class BATCHOP_OT_apply_preview_material(Operator):
             )
             return {"CANCELLED"}
 
-        if context.object is not None and context.object.mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-
-        bpy.ops.object.select_all(action="DESELECT")
-
-        for obj in target_mesh_objects:
-            obj.select_set(True)
-
-        context.view_layer.objects.active = target_mesh_objects[0]
         context.view_layer.material_override = preview_material
         context.scene[PREVIEW_OVERRIDE_FLAG] = True
-        context.scene[PREVIEW_LOCAL_VIEW_FLAG] = set_target_local_view(
-            context,
-            set(target_mesh_objects),
-            True,
-        )
+        context.scene[PREVIEW_LOCAL_VIEW_FLAG] = False
+
+        if target_mesh_objects:
+            context.scene[PREVIEW_LOCAL_VIEW_FLAG] = set_target_local_view(
+                context,
+                set(target_mesh_objects),
+                True,
+            )
+
         set_material_preview_viewport(context)
 
-        self.report(
-            {"INFO"},
-            f"Preview override enabled for viewing {len(target_mesh_objects)} target object(s).",
-        )
+        if snapshot_material_assignments(target_mesh_objects) != material_snapshot:
+            context.view_layer.material_override = current_override
+            context.scene[PREVIEW_OVERRIDE_FLAG] = False
+            context.scene[PREVIEW_LOCAL_VIEW_FLAG] = False
+            self.report({"ERROR"}, "Cancelled: material assignments changed unexpectedly.")
+            return {"CANCELLED"}
+
+        if target_mesh_objects:
+            message = (
+                f"Preview override enabled for viewing "
+                f"{len(target_mesh_objects)} target object(s)."
+            )
+        else:
+            message = "Preview override enabled for the current view layer."
+
+        self.report({"INFO"}, message)
         return {"FINISHED"}
+
+
+class BATCHOP_OT_toggle_preview_material(Operator):
+    bl_idname = "batch_operation.toggle_preview_material"
+    bl_label = "Toggle Preview Material"
+    bl_description = "Toggle the selected material as a view-only material override"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if is_preview_material_override_active(context):
+            return bpy.ops.batch_operation.revert_preview_material()
+
+        return bpy.ops.batch_operation.apply_preview_material()
 
 
 class BATCHOP_OT_revert_preview_material(Operator):
     bl_idname = "batch_operation.revert_preview_material"
     bl_label = "Revert Material"
-    bl_description = "Clear the PreviewMaterial viewport override"
+    bl_description = "Clear the selected material viewport override"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -531,7 +815,7 @@ class BATCHOP_OT_revert_preview_material(Operator):
 
         if not is_preview_material_override_active(context):
             context.scene[PREVIEW_OVERRIDE_FLAG] = False
-            self.report({"WARNING"}, f"{PREVIEW_MATERIAL_NAME} override is not active.")
+            self.report({"WARNING"}, "The selected preview material override is not active.")
             return {"CANCELLED"}
 
         context.view_layer.material_override = None
@@ -539,7 +823,7 @@ class BATCHOP_OT_revert_preview_material(Operator):
         if context.scene.get(PREVIEW_LOCAL_VIEW_FLAG, False):
             set_target_local_view(context, set(), False)
             context.scene[PREVIEW_LOCAL_VIEW_FLAG] = False
-        self.report({"INFO"}, f"Cleared {PREVIEW_MATERIAL_NAME} viewport override.")
+        self.report({"INFO"}, "Cleared material preview override.")
         return {"FINISHED"}
 
 
@@ -691,13 +975,23 @@ class BATCHOP_PT_main_panel(Panel):
         settings = context.scene.batch_operation_settings
 
         layout.operator("batch_operation.update_addon", icon="FILE_REFRESH")
-        layout.label(text="Tool Version: 0.22.0")
+        layout.label(text="Tool Version: 0.30.0")
         layout.label(text=f"Source: {__file__}")
         layout.separator()
 
         row = layout.row(align=True)
         row.prop(settings, "object_source", expand=True)
         row.operator("batch_operation.refresh_targets", text="", icon="FILE_REFRESH")
+
+        target_objects = get_target_objects(context)
+        target_mesh_objects = get_target_mesh_objects(context)
+        layout.label(
+            text=(
+                f"Target Objects: {len(target_objects)} "
+                f"({len(target_mesh_objects)} mesh)"
+            ),
+            icon="OBJECT_DATA",
+        )
 
         if settings.object_source == "DROP_LIST":
             row = layout.row()
@@ -768,11 +1062,41 @@ class BATCHOP_PT_main_panel(Panel):
             row = box.row()
             row.enabled = has_mesh_objects
             row.operator("batch_operation.open_uv_editor", icon="UV")
+        elif settings.operation == "REMOVE_UV_MAP":
+            uv_names = get_target_uv_map_names(context)
+            has_uv_maps = len(uv_names) > 0
+
+            box = layout.box()
+            box.label(text="Remove UV Map")
+            if has_uv_maps:
+                box.prop(settings, "remove_uv_map_choice")
+            else:
+                box.label(text="No UV maps available on target meshes.", icon="ERROR")
+
+            row = box.row()
+            row.enabled = has_uv_maps
+            row.operator("batch_operation.remove_uv_map", icon="TRASH")
+        elif settings.operation == "REMOVE_ALL_MATERIALS":
+            impacted_objects, impacted_mesh_data = get_material_removal_impact(context)
+            has_materials = len(impacted_mesh_data) > 0
+
+            box = layout.box()
+            box.label(text="Remove All Materials")
+            if has_materials:
+                box.label(text=f"Objects impacted: {len(impacted_objects)}")
+                box.label(text=f"Mesh data-blocks changed: {len(impacted_mesh_data)}")
+            else:
+                box.label(text="No target mesh materials available.", icon="ERROR")
+
+            row = box.row()
+            row.enabled = has_materials
+            row.operator("batch_operation.remove_all_materials", icon="TRASH")
 
         layout.separator()
 
         target_mesh_objects = get_target_mesh_objects(context)
         has_mesh_objects = len(target_mesh_objects) > 0
+        has_materials = len(bpy.data.materials) > 0
         can_use_material_override = supports_material_override(context)
         preview_override_active = is_preview_material_override_active(context)
         current_material_override = get_current_material_override(context)
@@ -781,26 +1105,30 @@ class BATCHOP_PT_main_panel(Panel):
         )
 
         material_box = layout.box()
-        material_box.label(text="Material Switcher")
-        material_box.label(text=f"Preview override: {PREVIEW_MATERIAL_NAME}")
+        material_box.label(text="Material Preview")
         material_box.label(text="Mode: View layer material override")
+
+        if has_materials:
+            material_box.prop(settings, "preview_material_choice")
+        else:
+            material_box.label(text="No materials available.", icon="ERROR")
+
+        toggle_text = "Revert Preview Material" if preview_override_active else "Preview Material"
+        toggle_icon = "FILE_REFRESH" if preview_override_active else "MATERIAL"
 
         row = material_box.row(align=True)
         row.enabled = (
-            has_mesh_objects
+            has_materials
             and can_use_material_override
-            and not preview_override_active
             and not other_override_active
         )
-        row.operator("batch_operation.apply_preview_material", icon="MATERIAL")
+        row.operator(
+            "batch_operation.toggle_preview_material",
+            text=toggle_text,
+            icon=toggle_icon,
+        )
 
-        row = material_box.row(align=True)
-        row.enabled = can_use_material_override and preview_override_active
-        row.operator("batch_operation.revert_preview_material", icon="FILE_REFRESH")
-
-        if not has_mesh_objects:
-            material_box.label(text="No target mesh objects available.", icon="ERROR")
-        elif not can_use_material_override:
+        if not can_use_material_override:
             material_box.label(text="Material override is unavailable here.", icon="ERROR")
         elif preview_override_active:
             material_box.label(text="Preview override is active.", icon="INFO")
@@ -809,8 +1137,10 @@ class BATCHOP_PT_main_panel(Panel):
                 text=f'View layer already overrides with "{current_material_override.name}".',
                 icon="ERROR",
             )
-        else:
+        elif has_mesh_objects:
             material_box.label(text="Mesh material assignments are never changed.", icon="INFO")
+        else:
+            material_box.label(text="No targets: preview applies to the view layer.", icon="INFO")
 
 
 classes = (
@@ -820,8 +1150,11 @@ classes = (
     BATCHOP_OT_switch_uv_map,
     BATCHOP_OT_rename_uv_map,
     BATCHOP_OT_open_uv_editor,
+    BATCHOP_OT_remove_uv_map,
+    BATCHOP_OT_remove_all_materials,
     BATCHOP_OT_refresh_targets,
     BATCHOP_OT_apply_preview_material,
+    BATCHOP_OT_toggle_preview_material,
     BATCHOP_OT_revert_preview_material,
     BATCHOP_OT_add_object_list_item,
     BATCHOP_OT_add_selected_to_object_list,
